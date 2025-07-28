@@ -1,0 +1,31 @@
+{
+  "name": "DeepStream Setup Test",
+  "image": "nvcr.io/nvidia/deepstream:7.1-gc-triton-devel",
+  "runArgs": [
+    "--gpus=all",
+    "--network=host",
+    "--privileged",
+    "-v", "/tmp/.X11-unix:/tmp/.X11-unix",
+    "-e", "DISPLAY=${localEnv:DISPLAY}"
+  ],
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.pylint",
+        "ms-python.black-formatter",
+        "ms-toolsai.jupyter"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/bin/python3",
+        "python.formatting.provider": "black"
+      }
+    }
+  },
+  "remoteUser": "root",
+  "postCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh",
+  "forwardPorts": [],
+  "features": {}
+}
