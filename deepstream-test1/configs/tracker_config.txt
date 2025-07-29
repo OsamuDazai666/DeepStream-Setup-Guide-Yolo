@@ -1,0 +1,7 @@
+[tracker]
+tracker-width=640
+tracker-height=384
+ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so
+ll-config-file=/workspace/deepstream-test1/configs/config_tracker_NvDCF_perf.yml
+gpu-id=0
+enable-batch-process=1
