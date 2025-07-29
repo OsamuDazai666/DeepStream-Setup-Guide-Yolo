@@ -1,70 +1,109 @@
-- first update the entire system using the built in .sh file.
+# DeepStream YOLO Setup Guide
+
+This guide provides step-by-step instructions for setting up and running YOLO models with NVIDIA DeepStream.
+
+## Prerequisites
+
+- NVIDIA GPU with CUDA support
+- NVIDIA DeepStream SDK 7.1 or later
+- Python 3.6 or higher
+- Git
+
+## Setup Instructions
+
+### 1. System Update
+Update your system using the provided DeepStream scripts:
+
 ```bash
-root@inlights-B360M-HD3:/workspace# ls ../opt/nvidia/deepstream/deepstream-7.1/
-    update_rtpmanager.sh
-    user_additional_install.sh 
-    user_deepstream_python_apps_install.sh 
+# List available update scripts
+ls /opt/nvidia/deepstream/deepstream-7.1/
+# Run the necessary update scripts
+# Example:
+# sudo ./update_rtpmanager.sh
+# sudo ./user_additional_install.sh
+# sudo ./user_deepstream_python_apps_install.sh
 ```
 
-- clone the Deepstream-Yolo github.
+### 2. Clone Required Repositories
+
 ```bash
-$ git clone https://github.com/marcoslucianops/DeepStream-Yolo.git
-```
- 
-- clone the ultralytics repo and install requirements
-```bash
+# Clone DeepStream-Yolo repository
+git clone https://github.com/marcoslucianops/DeepStream-Yolo.git
+
+# Clone Ultralytics repository
 git clone https://github.com/ultralytics/ultralytics.git
 cd ultralytics
+
+# Install requirements
 pip3 install -e .
 pip3 install onnx onnxslim onnxruntime
 ```
 
-- copy the **python3 export_yolo11.py -w yolo11s.pt --dynamic** to **ultralytics** directory.
+### 3. Prepare YOLO Model
+
+1. Copy the export script:
+   ```bash
+   cp DeepStream-Yolo/utils/export_yolo11.py ultralytics/
+   ```
+
+2. Convert your YOLO model to ONNX format:
+   ```bash
+   cd ultralytics
+   python3 export_yolo11.py -w path/to/your/yolo11s.pt --dynamic
+   ```
+   
+   This will generate a `.pt.onnx` file in the current directory.
+
+### 4. Configure DeepStream
+
+1. Update the inference configuration file at `DeepStream-Yolo/config_infer_primary_yolo11.txt`:
+   ```ini
+   [property]
+   # Update these paths to your model and labels
+   onnx-file=path/to/your/yolo11s.pt.onnx
+   model-engine-file=model_b1_gpu0_fp16.engine
+   labelfile-path=labels.txt
+   num-detected-classes=80
+   parse-bbox-func-name=NvDsInferParseYolo
+   ```
+
+2. Update the DeepStream app configuration at `DeepStream-Yolo/deepstream_app_config.txt`:
+   ```ini
+   [primary-gie]
+   enable=1
+   gpu-id=0
+   model-engine-file=model_b1_gpu0_fp16.engine
+   config-file=config_infer_primary_yolo11.txt
+   ```
+
+### 5. Environment Setup
+
+Set the CUDA version environment variable:
 ```bash
-$ cp DeepStream-Yolo/utils/export_yolo11.py ultralytics/
+export CUDA_VER=12.6
 ```
 
-- use the **DeepStream-Yolo/utils/export_yolo11.py** file to convert your yolo model to **pt.onnx** format.
+### 6. Build the Custom YOLO Plugin
+
 ```bash
-## conversion example
-$ python3 export_yolo11.py -w yolo11s.pt --dynamic
+cd DeepStream-Yolo
+make -C nvdsinfer_custom_impl_Yolo clean
+make -C nvdsinfer_custom_impl_Yolo
 ```
 
-- copy the path of **pt.onnx** and **labels.txt** file in **DeepStream-Yolo/config_infer_primary_yolo11.txt**
+### 7. Run the Application
+
 ```bash
-[property]
-...
-onnx-file=yolo11s.pt.onnx
-...
-num-detected-classes=80
-...
-parse-bbox-func-name=NvDsInferParseYolo
+cd DeepStream-Yolo
+deepstream-app -c deepstream_app_config.txt
 ```
 
-- Also modify the path inside **DeepStream-Yolo/deepstream_app_config.txt**.
-```bash
-...
-[primary-gie]
-...
-config-file=config_infer_primary_yolo11.txt
-```
+## Troubleshooting
 
-- **[Important Step]** set the enironment variable
-```bash
-$ export CUDA_VER=12.6
-```
+- **CUDA Version Mismatch**: Ensure `CUDA_VER` is set to 12.6.
+- **Model Conversion Issues**: Verify your YOLO model is compatible with the export script
+- **Dependency Problems**: Make sure all Python packages are installed in the correct environment
 
-- compile the library.
-```bash
-$ cd DeepStream-Yolo
-$ make -C nvdsinfer_custom_impl_Yolo clean && make -C nvdsinfer_custom_impl_Yolo 
-```
+## Support
 
-- now just change the paths in **DeepStream-Yolo/config_infer_primary_yolo11.txt**
-
-- run the deepstream-app
-```bash
-$ deepstream-app -c deepstream_app_config.txt
-```
-
-
+For issues and feature requests, please open an issue in the [DeepStream-Yolo](https://github.com/marcoslucianops/DeepStream-Yolo) repository.
