@@ -4,3 +4,4 @@ deepstream_python_apps/
 common/
 models/
 core
+*.engine
