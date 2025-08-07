@@ -5,3 +5,4 @@ common/
 models/
 core
 *.engine
+*.so
