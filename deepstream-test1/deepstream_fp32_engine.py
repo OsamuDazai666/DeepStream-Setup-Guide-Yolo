@@ -1,7 +1,6 @@
 import sys
 sys.path.append("../")
-from common.bus_call import bus_call
-from common.platform_info import PlatformInfo
+from utils import bus_call_func, PlatformInfo
 import pyds
 import platform
 import math
@@ -13,6 +12,7 @@ gi.require_version("GstRtspServer", "1.0")
 from gi.repository import Gst, GstRtspServer, GLib
 import configparser
 import datetime
+from typing import List
 
 import argparse
 
@@ -170,168 +170,190 @@ def create_source_bin(index, uri):
     Gst.Bin.add(nbin, uri_decode_bin)
     bin_pad = nbin.add_pad(
         Gst.GhostPad.new_no_target(
-            "src", Gst.PadDirection.SRC))
+            "src", 
+            Gst.PadDirection.SRC
+        )
+    )
     if not bin_pad:
         sys.stderr.write(" Failed to add ghost pad in source bin \n")
         return None
     return nbin
 
 
-def main(stream_paths):
+class NvPipeline:
+    def __init__(self, stream_paths: List):
+        Gst.init(None)
+        
+        self.platform_info = PlatformInfo()
+        self.stream_paths = stream_paths
 
-    platform_info = PlatformInfo()
+        self.rtsp_port_num = 8555
+        self.udpsink_port_num = 5400
 
-    # Standard GStreamer initialization
-    Gst.init(None)
+        self.pipeline = Gst.Pipeline()
+        if not self.pipeline:
+            print("Unable to create pipeline")
 
-    # Create Gstream Pipeline
-    pipeline = Gst.Pipeline()
-    if not pipeline:
-        sys.stderr.write(" Unable to create Pipeline \n")
+    def _plugins_created_succesfully(self, plugins: List) -> bool:
+        # for e in [nvinfer, tracker, tiler, nvvidconv, nvosd, nvvidconv_postosd, caps, encoder, rtppay, sink]:
+        for e in plugins:
+            if not e:
+                print(f"Error: in element {e}")
+                return False
+            self.pipeline.add(e)
+        
+        return True
 
-    # create nvstreamux for batch inference and tracking
-    streammux = Gst.ElementFactory.make("nvstreammux", "Stream-muxer")
-    streammux.set_property("width", 1920)
-    streammux.set_property("height", 1080)
-    streammux.set_property("batch-size", len(stream_paths))
-    streammux.set_property("batched-push-timeout", MUXER_BATCH_TIMEOUT_USEC)
+    def build_pipeline(self):
+        streammux = Gst.ElementFactory.make("nvstreammux", "Stream-muxer")
+        streammux.set_property("width", 1920)
+        streammux.set_property("height", 1080)
+        streammux.set_property("batch-size", len(self.stream_paths))
+        streammux.set_property("batched-push-timeout", MUXER_BATCH_TIMEOUT_USEC)
 
-    # add streamux to pipeline
-    pipeline.add(streammux)
+        # add streamux to pipeline
+        self.pipeline.add(streammux)
+        is_live = False # temp varaible
+        for i, stream_path in enumerate(self.stream_paths):
+            if stream_path.find("rtsp://") == 0:
+                is_live = True
 
-    is_live = False # temp varaible
-    for i, stream_path in enumerate(stream_paths):
-        print("Creating source_bin ", i, " \n ")
-        if stream_path.find("rtsp://") == 0:
-            is_live = True
+            source_bin = create_source_bin(i, stream_path)
+            if not source_bin:
+                print("unable to create source")
 
-        source_bin = create_source_bin(i, stream_path)
-        if not source_bin:
-            print("unable to create source")
+            self.pipeline.add(source_bin)
 
-        pipeline.add(source_bin)
+            padname = "sink_%u" % i
+            sinkpad = streammux.request_pad_simple(padname)
+            if not sinkpad:
+                print("Unable to create sink pad bin")
 
-        padname = "sink_%u" % i
-        sinkpad = streammux.request_pad_simple(padname)
-        if not sinkpad:
-            print("Unable to create sink pad bin \n")
+            srcpad = source_bin.get_static_pad("src")
+            if not srcpad:
+                print("Unable to create src pad bin")
 
-        srcpad = source_bin.get_static_pad("src")
-        if not srcpad:
-            print("Unable to create src pad bin \n")
+            srcpad.link(sinkpad)
 
-        srcpad.link(sinkpad)
+        nvinfer = Gst.ElementFactory.make("nvinfer", "primary-inference")
+        nvinfer.set_property("config-file-path", "/workspace/deepstream-test1/configs/config_infer_primary_yolo11_fp32.txt")
 
-    nvinfer = Gst.ElementFactory.make("nvinfer", "primary-inference")
-    nvinfer.set_property("config-file-path", "/workspace/deepstream-test1/configs/config_infer_primary_yolo11_fp32.txt")
+        # attach a probe to nvinfer plugin
+        pgie_src_pad=nvinfer.get_static_pad("src")
+        if not pgie_src_pad:
+            sys.stderr.write(" Unable to get src pad \n")
+        else:
+            pgie_src_pad.add_probe(Gst.PadProbeType.BUFFER, pgie_src_pad_buffer_probe, 0)
 
-    tracker = Gst.ElementFactory.make("nvtracker", "tracker")
-    tracker.set_property("tracker-width", 640)
-    tracker.set_property("tracker-height", 384)
-    tracker.set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
-    tracker.set_property("ll-config-file", tracker_config)
-
-    tiler = Gst.ElementFactory.make("nvmultistreamtiler", "nvtiler")
-    tiler_rows = int(math.sqrt(len(stream_paths)))
-    tiler_columns = int(math.ceil((1.0 * len(stream_paths)) / tiler_rows))
-    tiler.set_property("rows", tiler_rows)
-    tiler.set_property("columns", tiler_columns)
-    tiler.set_property("width", TILED_OUTPUT_WIDTH)
-    tiler.set_property("height", TILED_OUTPUT_HEIGHT)
-
-    nvvidconv = Gst.ElementFactory.make("nvvideoconvert", "convertor")
-
-    caps = Gst.ElementFactory.make("capsfilter", "filter")
-    caps.set_property(
-        "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420")
-    )
-
-    nvosd = Gst.ElementFactory.make("nvdsosd", "onscreendisplay")
-    nvosd.set_property("display-clock", 1)
-
-    nvvidconv_postosd = Gst.ElementFactory.make("nvvideoconvert", "convertor_postosd")
-
-    encoder = Gst.ElementFactory.make("nvv4l2h264enc", "encoder")
-    encoder.set_property("bitrate", bitrate)
-    if platform_info.is_integrated_gpu():
-        encoder.set_property("preset-level", 1)
-        encoder.set_property("insert-sps-pps", 1)
-
-    rtppay = Gst.ElementFactory.make("rtph264pay", "rtppay")
-
-    sink = Gst.ElementFactory.make("udpsink", "udpsink")
-    updsink_port_num = 5400
-    sink.set_property("host", "224.224.255.255")
-    sink.set_property("port", updsink_port_num)
-    sink.set_property("async", False)
-    sink.set_property("sync", 1)
-    sink.set_property("qos", 0)
+        tracker = Gst.ElementFactory.make("nvtracker", "tracker")
+        tracker.set_property("tracker-width", 640)
+        tracker.set_property("tracker-height", 384)
+        tracker.set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
+        tracker.set_property("ll-config-file", tracker_config)
 
 
-    for e in [nvinfer, tracker, tiler, nvvidconv, nvosd, nvvidconv_postosd, caps, encoder, rtppay, sink]:
-        if not e:
-            print(f"Error: in element {e}")
-            return
-        pipeline.add(e)
+        tiler = Gst.ElementFactory.make("nvmultistreamtiler", "nvtiler")
+        tiler_rows = int(math.sqrt(len(self.stream_paths)))
+        tiler_columns = int(math.ceil((1.0 * len(self.stream_paths)) / tiler_rows))
+        tiler.set_property("rows", tiler_rows)
+        tiler.set_property("columns", tiler_columns)
+        tiler.set_property("width", TILED_OUTPUT_WIDTH)
+        tiler.set_property("height", TILED_OUTPUT_HEIGHT)
 
-    streammux.link(nvinfer)
-    nvinfer.link(tracker)
-    tracker.link(nvvidconv)
-    nvvidconv.link(tiler)
-    tiler.link(nvosd)
-    nvosd.link(nvvidconv_postosd)
-    nvvidconv_postosd.link(caps)
-    caps.link(encoder)
-    encoder.link(rtppay)
-    rtppay.link(sink)
+        nvvidconv = Gst.ElementFactory.make("nvvideoconvert", "convertor")
 
-    # create an event loop and feed gstreamer bus mesages to it
-    loop = GLib.MainLoop()
-    bus = pipeline.get_bus()
-    bus.add_signal_watch()
-    bus.connect("message", bus_call, loop)
+        caps = Gst.ElementFactory.make("capsfilter", "filter")
+        caps.set_property(
+            "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420")
+        )
 
-    pgie_src_pad=nvinfer.get_static_pad("src")
-    if not pgie_src_pad:
-        sys.stderr.write(" Unable to get src pad \n")
-    else:
-        pgie_src_pad.add_probe(Gst.PadProbeType.BUFFER, pgie_src_pad_buffer_probe, 0)
+        nvosd = Gst.ElementFactory.make("nvdsosd", "onscreendisplay")
+        nvosd.set_property("display-clock", 1)
 
-    # Start streaming
-    rtsp_port_num = 8555
+        nvvidconv_postosd = Gst.ElementFactory.make("nvvideoconvert", "convertor_postosd")
 
-    server = GstRtspServer.RTSPServer.new()
-    server.props.service = "%d" % rtsp_port_num
-    server.attach(None)
+        encoder = Gst.ElementFactory.make("nvv4l2h264enc", "encoder")
+        encoder.set_property("bitrate", bitrate)
+        if self.platform_info.is_integrated_gpu():
+            encoder.set_property("preset-level", 1)
+            encoder.set_property("insert-sps-pps", 1)
 
-    factory = GstRtspServer.RTSPMediaFactory.new()
-    factory.set_launch(
-        '( udpsrc name=pay0 port=%d buffer-size=524288 caps="application/x-rtp, media=video, clock-rate=90000, encoding-name=(string)%s, payload=96 " )'
-        % (updsink_port_num, codec)
-    )
-    factory.set_shared(True)
-    server.get_mount_points().add_factory("/ds-test", factory)
+        rtppay = Gst.ElementFactory.make("rtph264pay", "rtppay")
 
-    print(
-        "\n *** DeepStream: Launched RTSP Streaming at rtsp://localhost:%d/ds-test ***\n\n"
-        % rtsp_port_num
-    )
+        sink = Gst.ElementFactory.make("udpsink", "udpsink")
+        sink.set_property("host", "224.224.255.255")
+        sink.set_property("port", self.udpsink_port_num)
+        sink.set_property("async", False)
+        sink.set_property("sync", 1)
+        sink.set_property("qos", 0)
 
-    # start play back and listen to events
-    print("Starting pipeline \n")
-    pipeline.set_state(Gst.State.PLAYING)
-    try:
-        loop.run()
-    except BaseException:
-        pass
-    # cleanup
-    pipeline.set_state(Gst.State.NULL)
+        scc = self._plugins_created_succesfully([nvinfer, tracker, tiler, nvvidconv, nvosd, nvvidconv_postosd, caps, encoder, rtppay, sink])
+        if not scc:
+            print("Plugins Not Created Sccuesfully")
 
+        streammux.link(nvinfer)
+        nvinfer.link(tracker)
+        tracker.link(nvvidconv)
+        nvvidconv.link(tiler)
+        tiler.link(nvosd)
+        nvosd.link(nvvidconv_postosd)
+        nvvidconv_postosd.link(caps)
+        caps.link(encoder)
+        encoder.link(rtppay)
+        rtppay.link(sink)
+
+
+
+    def run(self):
+        self.build_pipeline()
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+
+        # Start Pipeline
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+        stream = RTSP_Stream(self.rtsp_port_num, self.udpsink_port_num)
+        stream.run()
+
+        # set the 
+        self.pipeline.set_state(Gst.State.NULL)
+
+
+class RTSP_Stream:
+    def __init__(self, rtsp_port_num, udp_port_num) -> None:
+        self.rtsp_port_num = rtsp_port_num
+
+        self.server = GstRtspServer.RTSPServer.new()
+        self.server.props.service = "%d" % self.rtsp_port_num
+        self.server.attach(None)
+
+        self.factory = GstRtspServer.RTSPMediaFactory.new()
+        self.factory.set_launch(
+            '( udpsrc name=pay0 port=%d buffer-size=524288 caps="application/x-rtp, media=video, clock-rate=90000, encoding-name=(string)%s, payload=96 " )'
+            % (udp_port_num, codec)
+        )
+        self.factory.set_shared(True)
+
+        self.server.get_mount_points().add_factory("/ds-test", self.factory)
+
+        self.stream_uri = f"Output RTSP: rtsp://localhost:{self.rtsp_port_num}/ds-test" 
+
+        print(
+            "\n\n",
+            self.stream_uri,
+            "\n\n"
+        )
+    
+    def run(self):
+        loop = GLib.MainLoop()
+        try:
+            loop.run()
+        except BaseException:
+            pass
 
 if __name__ == '__main__':
-    # create 20 instance of the same stream
-    stream_path = [
-        "rtsp://0.0.0.0:8554/mystream" for i in range(20)
+    stream_paths = [
+        "rtsp://0.0.0.0:8554/mystream" for _ in range(1)
     ] 
-    main(stream_path)
-
+    obj = NvPipeline(stream_paths)
+    obj.run()
