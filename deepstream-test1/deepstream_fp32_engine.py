@@ -1,21 +1,3 @@
-#!/usr/bin/env python3
-
-################################################################################
-# SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
 import sys
 sys.path.append("../")
 from common.bus_call import bus_call
@@ -43,14 +25,15 @@ GST_CAPS_FEATURES_NVMM = "memory:NVMM"
 OSD_PROCESS_MODE = 0
 OSD_DISPLAY_TEXT = 0
 pgie_classes_str = ["Vehicle", "TwoWheeler", "Person", "RoadSign"]
+gie = "nvinfer"
+codec = "H264"
+bitrate = 4000000
+ts_from_rtsp = False
+tracker_config = "/workspace/deepstream-test1/configs/config_tracker_NvDCF_perf.yml"
+
 
 # FPS tracking variables
 fps_streams = {}
-
-# pgie_src_pad_buffer_probe  will extract metadata received on OSD sink pad
-# and update params for drawing rectangle, object information etc.
-
-
 def pgie_src_pad_buffer_probe(pad, info, u_data):
     frame_number = 0
     num_rects = 0
@@ -194,185 +177,105 @@ def create_source_bin(index, uri):
     return nbin
 
 
-def main(args):
-    # Check input arguments
-    number_sources = len(args)
+def main(stream_paths):
 
     platform_info = PlatformInfo()
+
     # Standard GStreamer initialization
     Gst.init(None)
 
-    # Create gstreamer elements */
-    # Create Pipeline element that will form a connection of other elements
-    print("Creating Pipeline \n ")
+    # Create Gstream Pipeline
     pipeline = Gst.Pipeline()
-    is_live = False
-
     if not pipeline:
         sys.stderr.write(" Unable to create Pipeline \n")
-    print("Creating streamux \n ")
 
-    # Create nvstreammux instance to form batches from one or more sources.
+    # create nvstreamux for batch inference and tracking
     streammux = Gst.ElementFactory.make("nvstreammux", "Stream-muxer")
-    if not streammux:
-        sys.stderr.write(" Unable to create NvStreamMux \n")
+    streammux.set_property("width", 1920)
+    streammux.set_property("height", 1080)
+    streammux.set_property("batch-size", len(stream_paths))
+    streammux.set_property("batched-push-timeout", MUXER_BATCH_TIMEOUT_USEC)
 
+    # add streamux to pipeline
     pipeline.add(streammux)
-    for i in range(number_sources):
+
+    is_live = False # temp varaible
+    for i, stream_path in enumerate(stream_paths):
         print("Creating source_bin ", i, " \n ")
-        uri_name = args[i]
-        if uri_name.find("rtsp://") == 0:
+        if stream_path.find("rtsp://") == 0:
             is_live = True
-        source_bin = create_source_bin(i, uri_name)
+
+        source_bin = create_source_bin(i, stream_path)
         if not source_bin:
-            sys.stderr.write("Unable to create source bin \n")
+            print("unable to create source")
+
         pipeline.add(source_bin)
+
         padname = "sink_%u" % i
         sinkpad = streammux.request_pad_simple(padname)
         if not sinkpad:
-            sys.stderr.write("Unable to create sink pad bin \n")
+            print("Unable to create sink pad bin \n")
+
         srcpad = source_bin.get_static_pad("src")
         if not srcpad:
-            sys.stderr.write("Unable to create src pad bin \n")
+            print("Unable to create src pad bin \n")
+
         srcpad.link(sinkpad)
 
-    print("Creating Pgie \n ")
-    if gie=="nvinfer":
-        pgie = Gst.ElementFactory.make("nvinfer", "primary-inference")
-    else:
-        pgie = Gst.ElementFactory.make("nvinferserver", "primary-inference")
-    if not pgie:
-        sys.stderr.write(" Unable to create pgie \n")
+    nvinfer = Gst.ElementFactory.make("nvinfer", "primary-inference")
+    nvinfer.set_property("config-file-path", "/workspace/deepstream-test1/configs/config_infer_primary_yolo11_fp32.txt")
 
-
-
-
-
-
-
-
-
-    print("Creating nvtracker \n ")
     tracker = Gst.ElementFactory.make("nvtracker", "tracker")
-    if not tracker:
-        sys.stderr.write(" Unable to create tracker \n")
-
-    print("Creating tiler \n ")
-    tiler = Gst.ElementFactory.make("nvmultistreamtiler", "nvtiler")
-    if not tiler:
-        sys.stderr.write(" Unable to create tiler \n")
-    print("Creating nvvidconv \n ")
-    nvvidconv = Gst.ElementFactory.make("nvvideoconvert", "convertor")
-
-
-
-
-
-
-    # Create a caps filter
-    caps = Gst.ElementFactory.make("capsfilter", "filter")
-    caps.set_property(
-        "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420")
-    )
-
-
-
-
-
-
-
-    if not nvvidconv:
-        sys.stderr.write(" Unable to create nvvidconv \n")
-    print("Creating nvosd \n ")
-    nvosd = Gst.ElementFactory.make("nvdsosd", "onscreendisplay")
-    if not nvosd:
-        sys.stderr.write(" Unable to create nvosd \n")
-    nvvidconv_postosd = Gst.ElementFactory.make(
-        "nvvideoconvert", "convertor_postosd")
-    if not nvvidconv_postosd:
-        sys.stderr.write(" Unable to create nvvidconv_postosd \n")
-
-
-    # Make the encoder
-    if codec == "H264":
-        encoder = Gst.ElementFactory.make("nvv4l2h264enc", "encoder")
-        print("Creating H264 Encoder")
-    elif codec == "H265":
-        encoder = Gst.ElementFactory.make("nvv4l2h265enc", "encoder")
-        print("Creating H265 Encoder")
-    if not encoder:
-        sys.stderr.write(" Unable to create encoder")
-    encoder.set_property("bitrate", bitrate)
-    if platform_info.is_integrated_gpu():
-        encoder.set_property("preset-level", 1)
-        encoder.set_property("insert-sps-pps", 1)
-        #encoder.set_property("bufapi-version", 1)
-
-    # Make the payload-encode video into RTP packets
-    if codec == "H264":
-        rtppay = Gst.ElementFactory.make("rtph264pay", "rtppay")
-        print("Creating H264 rtppay")
-    elif codec == "H265":
-        rtppay = Gst.ElementFactory.make("rtph265pay", "rtppay")
-        print("Creating H265 rtppay")
-    if not rtppay:
-        sys.stderr.write(" Unable to create rtppay")
-
-    # Make the UDP sink
-    updsink_port_num = 5400
-    sink = Gst.ElementFactory.make("udpsink", "udpsink")
-    if not sink:
-        sys.stderr.write(" Unable to create udpsink")
-
-    sink.set_property("host", "224.224.255.255")
-    sink.set_property("port", updsink_port_num)
-    sink.set_property("async", False)
-    sink.set_property("sync", 1)
-
-    streammux.set_property("width", 1920)
-    streammux.set_property("height", 1080)
-    streammux.set_property("batch-size", number_sources)
-    streammux.set_property("batched-push-timeout", MUXER_BATCH_TIMEOUT_USEC)
-    
-    if ts_from_rtsp:
-        streammux.set_property("attach-sys-ts", 0)
-
-    if gie=="nvinfer":
-        pgie.set_property("config-file-path", "/workspace/deepstream-test1/configs/config_infer_primary_yolo11_fp32.txt")
-    else:
-        pgie.set_property("config-file-path", "/workspace/deepstream-test1/configs/config_infer_primary_yolo11_int.txt")
-
-    # Configure tracker
-    if not tracker:
-        print("Unable to create tracker")
-        return
     tracker.set_property("tracker-width", 640)
     tracker.set_property("tracker-height", 384)
     tracker.set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
     tracker.set_property("ll-config-file", tracker_config)
 
-    print("Adding elements to Pipeline \n")
-    tiler_rows = int(math.sqrt(number_sources))
-    tiler_columns = int(math.ceil((1.0 * number_sources) / tiler_rows))
+    tiler = Gst.ElementFactory.make("nvmultistreamtiler", "nvtiler")
+    tiler_rows = int(math.sqrt(len(stream_paths)))
+    tiler_columns = int(math.ceil((1.0 * len(stream_paths)) / tiler_rows))
     tiler.set_property("rows", tiler_rows)
     tiler.set_property("columns", tiler_columns)
     tiler.set_property("width", TILED_OUTPUT_WIDTH)
     tiler.set_property("height", TILED_OUTPUT_HEIGHT)
+
+    nvvidconv = Gst.ElementFactory.make("nvvideoconvert", "convertor")
+
+    caps = Gst.ElementFactory.make("capsfilter", "filter")
+    caps.set_property(
+        "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420")
+    )
+
+    nvosd = Gst.ElementFactory.make("nvdsosd", "onscreendisplay")
+    nvosd.set_property("display-clock", 1)
+
+    nvvidconv_postosd = Gst.ElementFactory.make("nvvideoconvert", "convertor_postosd")
+
+    encoder = Gst.ElementFactory.make("nvv4l2h264enc", "encoder")
+    encoder.set_property("bitrate", bitrate)
+    if platform_info.is_integrated_gpu():
+        encoder.set_property("preset-level", 1)
+        encoder.set_property("insert-sps-pps", 1)
+
+    rtppay = Gst.ElementFactory.make("rtph264pay", "rtppay")
+
+    sink = Gst.ElementFactory.make("udpsink", "udpsink")
+    updsink_port_num = 5400
+    sink.set_property("host", "224.224.255.255")
+    sink.set_property("port", updsink_port_num)
+    sink.set_property("async", False)
+    sink.set_property("sync", 1)
     sink.set_property("qos", 0)
 
-    pipeline.add(pgie)
-    pipeline.add(tracker)
-    pipeline.add(tiler)
-    pipeline.add(nvvidconv)
-    pipeline.add(nvosd)
-    pipeline.add(nvvidconv_postosd)
-    pipeline.add(caps)
-    pipeline.add(encoder)
-    pipeline.add(rtppay)
-    pipeline.add(sink)
 
-    streammux.link(pgie)
-    pgie.link(tracker)
+    for e in [nvinfer, tracker, tiler, nvvidconv, nvosd, nvvidconv_postosd, caps, encoder, rtppay, sink]:
+        if not e:
+            print(f"Error: in element {e}")
+            return
+        pipeline.add(e)
+
+    streammux.link(nvinfer)
+    nvinfer.link(tracker)
     tracker.link(nvvidconv)
     nvvidconv.link(tiler)
     tiler.link(nvosd)
@@ -388,7 +291,7 @@ def main(args):
     bus.add_signal_watch()
     bus.connect("message", bus_call, loop)
 
-    pgie_src_pad=pgie.get_static_pad("src")
+    pgie_src_pad=nvinfer.get_static_pad("src")
     if not pgie_src_pad:
         sys.stderr.write(" Unable to get src pad \n")
     else:
@@ -425,43 +328,10 @@ def main(args):
     pipeline.set_state(Gst.State.NULL)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='RTSP Output Sample Application Help ')
-    parser.add_argument("-i", "--input",
-                  help="Path to input H264 elementry stream", nargs="+", default=["a"], required=False)
-    parser.add_argument("-g", "--gie", default="nvinfer",
-                  help="choose GPU inference engine type nvinfer or nvinferserver , default=nvinfer", choices=['nvinfer','nvinferserver'])
-    parser.add_argument("-c", "--codec", default="H264",
-                  help="RTSP Streaming Codec H264/H265 , default=H264", choices=['H264','H265'])
-    parser.add_argument("-b", "--bitrate", default=4000000,
-                  help="Set the encoding bitrate ", type=int)
-    parser.add_argument("-t", "--tracker-config", default="config_tracker_NvDCF_perf.yml",
-                  help="Path to tracker config file")
-    parser.add_argument("--rtsp-ts", action="store_true", default=False, dest='rtsp_ts', help="Attach NTP timestamp from RTSP source",
-    )
-  
-    args = parser.parse_args()
-    global codec
-    global bitrate
-    global stream_path
-    global gie
-    global ts_from_rtsp
-    global tracker_config
-    gie = args.gie
-    codec = args.codec
-    bitrate = args.bitrate
-    
-    # Use hardcoded streams instead of command line input
-    stream_path = [
-        "rtsp://0.0.0.0:8554/mystream" for i in range(30)
-    ] 
-
-    
-    ts_from_rtsp = args.rtsp_ts
-    tracker_config = args.tracker_config
-    return stream_path
-
 if __name__ == '__main__':
-    stream_path = parse_args()
-    sys.exit(main(stream_path))
+    # create 20 instance of the same stream
+    stream_path = [
+        "rtsp://0.0.0.0:8554/mystream" for i in range(20)
+    ] 
+    main(stream_path)
 

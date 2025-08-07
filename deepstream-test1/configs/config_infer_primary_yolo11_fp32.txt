@@ -2,12 +2,12 @@
 gpu-id=0
 net-scale-factor=0.0039215697906911373
 model-color-format=0
-onnx-file=/workspace/models/yolo11s.pt.onnx
-model-engine-file=/workspace/deepstream-test1/model_b30_gpu0_fp32.engine
-labelfile-path=/workspace/models/labels.txt
-batch-size=30
+onnx-file=/workspace/models/PPECsV3.pt.onnx
+model-engine-file=/workspace/deepstream-test1/model_b22_gpu0_fp32.engine
+labelfile-path=/workspace/models/ppec_labels.txt
+batch-size=22
 network-mode=0  # <-- FP32 mode
-num-detected-classes=80
+num-detected-classes=7
 interval=0
 gie-unique-id=1
 process-mode=1
@@ -18,7 +18,7 @@ symmetric-padding=1
 #workspace-size=2000
 parse-bbox-func-name=NvDsInferParseYolo
 #parse-bbox-func-name=NvDsInferParseYoloCuda
-custom-lib-path=/workspace/models/libnvdsinfer_custom_impl_Yolo.so
+custom-lib-path=/workspace/PPEC.so
 engine-create-func-name=NvDsInferYoloCudaEngineGet
 
 [class-attrs-all]
