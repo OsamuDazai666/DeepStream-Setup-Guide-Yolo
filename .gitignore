@@ -6,3 +6,5 @@ models/
 core
 *.engine
 *.so
+engines/
+__pycache__
