@@ -1,20 +1,20 @@
-import sys
-sys.path.append("../")
-from utils import bus_call_func, PlatformInfo
-import pyds
-import time
-from ctypes import *
 import gi
+import sys
+import time
+sys.path.append("../")
+from utils import PlatformInfo
+import pyds
+from ctypes import *
 gi.require_version("Gst", "1.0")
 gi.require_version("GstRtspServer", "1.0")
 from gi.repository import Gst, GstRtspServer, GLib
-import datetime
 from typing import List
+from redis_tools import RedisPublisherManager
 
 
 MUXER_OUTPUT_WIDTH = 1920
 MUXER_OUTPUT_HEIGHT = 1080
-MUXER_BATCH_TIMEOUT_USEC = 33000
+MUXER_BATCH_TIMEOUT_USEC = 10000
 TILED_OUTPUT_WIDTH = 1280
 TILED_OUTPUT_HEIGHT = 720
 GST_CAPS_FEATURES_NVMM = "memory:NVMM"
@@ -30,34 +30,77 @@ tracker_config = "/workspace/deepstream_app/configs/config_tracker_NvDCF_perf.ym
 
 # FPS tracking variables
 fps_streams = {}
+
 def pgie_src_pad_buffer_probe(pad, info, u_data):
+
     frame_number = 0
-    num_rects = 0
     gst_buffer = info.get_buffer()
     if not gst_buffer:
-        print("Unable to get GstBuffer ")
-        return
+        print("Unable to get GstBuffer")
+        return Gst.PadProbeReturn.OK
 
-    # Retrieve batch metadata from the gst_buffer
-    # Note that pyds.gst_buffer_get_nvds_batch_meta() expects the
-    # C address of gst_buffer as input, which is obtained with hash(gst_buffer)
     batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
     l_frame = batch_meta.frame_meta_list
+
+    redis_pub_manager = RedisPublisherManager()
+
     while l_frame is not None:
         try:
-            # Note that l_frame.data needs a cast to pyds.NvDsFrameMeta
-            # The casting is done by pyds.NvDsFrameMeta.cast()
-            # The casting also keeps ownership of the underlying memory
-            # in the C code, so the Python garbage collector will leave
-            # it alone.
             frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
         except StopIteration:
             break
 
         frame_number = frame_meta.frame_num
         source_id = frame_meta.source_id
-        
-        # FPS calculation - more stable approach
+
+        # --- NEW: Lists for your attributes ---
+        filtered_boxes = []
+        filtered_classes = []
+        filtered_confs = []
+        filtered_ids = []
+
+        # Traverse detected objects in the frame
+        l_obj = frame_meta.obj_meta_list
+        while l_obj is not None:
+            try:
+                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+            except StopIteration:
+                break
+
+            # Bounding box
+            rect_params = obj_meta.rect_params
+            x, y, w, h = rect_params.left, rect_params.top, rect_params.width, rect_params.height
+            filtered_boxes.append([x, y, w, h])
+
+            # Class
+            filtered_classes.append(obj_meta.class_id)
+
+            # Confidence
+            filtered_confs.append(obj_meta.confidence)
+
+            # Object ID (if tracker enabled)
+            filtered_ids.append(obj_meta.object_id)
+
+            try:
+                l_obj = l_obj.next
+            except StopIteration:
+                break
+
+        # --- publish data via redis manager ---
+        data = {
+            "Boxes:" : filtered_boxes,
+            "Classes:" : filtered_classes,
+            "Confs:" : filtered_confs,
+            "IDs" : filtered_ids,
+        }
+        print("\n\n")
+        print("-" * 25, source_id,"-" * 25)
+        print(data)
+        print("--"* 25)
+        print("\n\n")
+        redis_pub_manager.publish_data(source_id, data)
+
+        # --- FPS calculation ---
         current_time = time.time()
         if source_id not in fps_streams:
             fps_streams[source_id] = {
@@ -66,27 +109,21 @@ def pgie_src_pad_buffer_probe(pad, info, u_data):
                 'last_print_time': current_time,
                 'last_print_frame': 0
             }
-        
+
         fps_streams[source_id]['frame_count'] += 1
-        
-        # Calculate and print average FPS every 5 seconds
+
         time_elapsed = current_time - fps_streams[source_id]['last_print_time']
-        if time_elapsed >= 5.0:  # Print every 5 seconds
+        if time_elapsed >= 5.0:
             frames_processed = fps_streams[source_id]['frame_count'] - fps_streams[source_id]['last_print_frame']
             avg_fps = frames_processed / time_elapsed
-            
-            # Also calculate overall average FPS since start
+
             total_time_elapsed = current_time - fps_streams[source_id]['start_time']
             overall_avg_fps = fps_streams[source_id]['frame_count'] / total_time_elapsed
-            
-            print(f"Stream {source_id}: Frame {frame_number}, Current FPS: {avg_fps:.2f}, Overall Avg FPS: {overall_avg_fps:.2f}")
-            
+
+            print(f"Stream {source_id}: Current FPS: {avg_fps:.2f}, Overall Avg FPS: {overall_avg_fps:.2f}")
+
             fps_streams[source_id]['last_print_time'] = current_time
             fps_streams[source_id]['last_print_frame'] = fps_streams[source_id]['frame_count']
-        
-        if ts_from_rtsp:
-            ts = frame_meta.ntp_timestamp/1000000000 # Retrieve timestamp, put decimal in proper position for Unix format
-            print("RTSP Timestamp:",datetime.datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')) # Convert timestamp to UTC
 
         try:
             l_frame = l_frame.next
@@ -207,6 +244,7 @@ class NvPipeline:
         streammux.set_property("height", 1080)
         streammux.set_property("batch-size", len(self.stream_paths))
         streammux.set_property("batched-push-timeout", MUXER_BATCH_TIMEOUT_USEC)
+        streammux.set_property("live-source", 1)
 
         # add streamux to pipeline
         self.pipeline.add(streammux)
@@ -258,7 +296,7 @@ class NvPipeline:
 
         for i, uri in enumerate(self.stream_paths):
             q = Gst.ElementFactory.make("queue", f"queue_{i}")
-            osd = Gst.ElementFactory.make("nvdsosd", f"osd_{i}")  # 👈 move OSD here
+            osd = Gst.ElementFactory.make("nvdsosd", f"osd_{i}") 
             conv = Gst.ElementFactory.make("nvvideoconvert", f"video_convert_{i}")
             enc = Gst.ElementFactory.make("nvv4l2h264enc", f"encoder_{i}")
             enc.set_property("bitrate", 1000_000)
@@ -337,5 +375,6 @@ if __name__ == '__main__':
     stream_paths = [
         "rtsp://admin:InLights@192.168.18.29:554" for _ in range(2)
     ] 
+
     obj = NvPipeline(stream_paths)
     obj.run()
