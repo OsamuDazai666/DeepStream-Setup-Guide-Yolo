@@ -10,6 +10,25 @@ gi.require_version("GstRtspServer", "1.0")
 from gi.repository import Gst, GstRtspServer, GLib
 from typing import List
 from redis_tools import RedisPublisherManager
+from ws_client import WebSocketClient
+import logging, logging.handlers, sys, os, pathlib
+
+LOG_DIR   = pathlib.Path(__file__).with_suffix('')   # ./deepstream_app
+LOG_DIR.mkdir(exist_ok=True)
+
+LOG_FILE  = LOG_DIR / "main.log"
+MAX_BYTES = 5 * 1024 * 1024   # 5 MiB
+BACKUPS   = 2
+
+handler = logging.handlers.RotatingFileHandler(
+    LOG_FILE, maxBytes=MAX_BYTES, backupCount=BACKUPS
+)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[handler, logging.StreamHandler(sys.stdout)]
+)
+log = logging.getLogger("main")
 
 
 MUXER_OUTPUT_WIDTH = 1920
@@ -28,9 +47,12 @@ ts_from_rtsp = False
 tracker_config = "/workspace/deepstream_app/configs/config_tracker_NvDCF_perf.yml"
 
 
+redis_pub_manager = RedisPublisherManager()
+ws = WebSocketClient("ws://localhost:5000")
+ws.connect()
+
 # FPS tracking variables
 fps_streams = {}
-
 def pgie_src_pad_buffer_probe(pad, info, u_data):
 
     frame_number = 0
@@ -42,7 +64,6 @@ def pgie_src_pad_buffer_probe(pad, info, u_data):
     batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
     l_frame = batch_meta.frame_meta_list
 
-    redis_pub_manager = RedisPublisherManager()
 
     while l_frame is not None:
         try:
@@ -88,9 +109,9 @@ def pgie_src_pad_buffer_probe(pad, info, u_data):
 
         # --- publish data via redis manager ---
         data = {
-            "Boxes:" : filtered_boxes,
-            "Classes:" : filtered_classes,
-            "Confs:" : filtered_confs,
+            "Boxes" : filtered_boxes,
+            "Classes" : filtered_classes,
+            "Confs" : filtered_confs,
             "IDs" : filtered_ids,
         }
         redis_pub_manager.publish_data(source_id, data)
@@ -116,6 +137,7 @@ def pgie_src_pad_buffer_probe(pad, info, u_data):
             overall_avg_fps = fps_streams[source_id]['frame_count'] / total_time_elapsed
 
             print(f"Stream {source_id}: Current FPS: {avg_fps:.2f}, Overall Avg FPS: {overall_avg_fps:.2f}")
+            ws.ping()
 
             fps_streams[source_id]['last_print_time'] = current_time
             fps_streams[source_id]['last_print_frame'] = fps_streams[source_id]['frame_count']
@@ -368,7 +390,7 @@ class RTSP_Stream:
 
 if __name__ == '__main__':
     stream_paths = [
-        "rtsp://admin:InLights@192.168.18.29:554" for _ in range(2)
+        "rtsp://admin:InLights@192.168.18.29:554" for _ in range(1)
     ] 
 
     obj = NvPipeline(stream_paths)
