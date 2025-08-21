@@ -6,5 +6,7 @@ models/
 core
 *.engine
 *.so
+*.log
 engines/
+watch_dog/
 __pycache__
