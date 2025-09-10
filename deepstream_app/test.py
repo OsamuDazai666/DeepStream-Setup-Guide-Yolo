@@ -1,380 +1,338 @@
+#!/usr/bin/env python3
 import gi
 import sys
 import time
-sys.path.append("../")
-from utils import PlatformInfo
 import pyds
-from ctypes import *
 gi.require_version("Gst", "1.0")
 gi.require_version("GstRtspServer", "1.0")
 from gi.repository import Gst, GstRtspServer, GLib
 from typing import List
-from redis_tools import RedisPublisherManager
+import cv2
+import numpy as np
+import queue 
 
-
-MUXER_OUTPUT_WIDTH = 1920
-MUXER_OUTPUT_HEIGHT = 1080
-MUXER_BATCH_TIMEOUT_USEC = 10000
-TILED_OUTPUT_WIDTH = 1280
+MUXER_OUTPUT_WIDTH  = 640
+MUXER_OUTPUT_HEIGHT = 640
+MUXER_BATCH_TIMEOUT_USEC = 10_000
+TILED_OUTPUT_WIDTH  = 1280
 TILED_OUTPUT_HEIGHT = 720
-GST_CAPS_FEATURES_NVMM = "memory:NVMM"
-OSD_PROCESS_MODE = 0
-OSD_DISPLAY_TEXT = 0
-pgie_classes_str = ["Vehicle", "TwoWheeler", "Person", "RoadSign"]
-gie = "nvinfer"
-codec = "H264"
-bitrate = 4000000
-ts_from_rtsp = False
-tracker_config = "/workspace/deepstream_app/configs/config_tracker_NvDCF_perf.yml"
+OSD_PROCESS_MODE    = 0
+OSD_DISPLAY_TEXT    = 0
+TRACKER_CONFIG      = "/opt/nvidia/deepstream/deepstream-7.1/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml"
+PGIE_CONFIG         = "/opt/nvidia/deepstream/deepstream-7.1/samples/configs/deepstream-app/config_infer_primary.txt"
+# PGIE_CONFIG         = "/workspace/deepstream_app/configs/config_infer_primary_yolo11_fp32.txt"
+CODEC               = "H264"
+BITRATE             = 1_000_000
+RTSP_PORT           = 8555
+UDP_PORT_BASE       = 5400
+file_loop = False
 
-
-# FPS tracking variables
 fps_streams = {}
 
 def pgie_src_pad_buffer_probe(pad, info, u_data):
-
-    frame_number = 0
     gst_buffer = info.get_buffer()
     if not gst_buffer:
-        print("Unable to get GstBuffer")
         return Gst.PadProbeReturn.OK
 
     batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
     l_frame = batch_meta.frame_meta_list
-
-    redis_pub_manager = RedisPublisherManager()
-
-    while l_frame is not None:
+    while l_frame:
         try:
             frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
         except StopIteration:
             break
 
-        frame_number = frame_meta.frame_num
         source_id = frame_meta.source_id
+        fps_streams.setdefault(source_id, {"cnt":0, "start":time.time(), "last":time.time()})
+        fps_streams[source_id]["cnt"] += 1
 
-        # --- NEW: Lists for your attributes ---
-        filtered_boxes = []
-        filtered_classes = []
-        filtered_confs = []
-        filtered_ids = []
-
-        # Traverse detected objects in the frame
-        l_obj = frame_meta.obj_meta_list
-        while l_obj is not None:
-            try:
-                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
-            except StopIteration:
-                break
-
-            # Bounding box
-            rect_params = obj_meta.rect_params
-            x, y, w, h = rect_params.left, rect_params.top, rect_params.width, rect_params.height
-            filtered_boxes.append([x, y, w, h])
-
-            # Class
-            filtered_classes.append(obj_meta.class_id)
-
-            # Confidence
-            filtered_confs.append(obj_meta.confidence)
-
-            # Object ID (if tracker enabled)
-            filtered_ids.append(obj_meta.object_id)
-
-            try:
-                l_obj = l_obj.next
-            except StopIteration:
-                break
-
-        # --- publish data via redis manager ---
-        data = {
-            "Boxes:" : filtered_boxes,
-            "Classes:" : filtered_classes,
-            "Confs:" : filtered_confs,
-            "IDs" : filtered_ids,
-        }
-        print("\n\n")
-        print("-" * 25, source_id,"-" * 25)
-        print(data)
-        print("--"* 25)
-        print("\n\n")
-        redis_pub_manager.publish_data(source_id, data)
-
-        # --- FPS calculation ---
-        current_time = time.time()
-        if source_id not in fps_streams:
-            fps_streams[source_id] = {
-                'frame_count': 0,
-                'start_time': current_time,
-                'last_print_time': current_time,
-                'last_print_frame': 0
-            }
-
-        fps_streams[source_id]['frame_count'] += 1
-
-        time_elapsed = current_time - fps_streams[source_id]['last_print_time']
-        if time_elapsed >= 5.0:
-            frames_processed = fps_streams[source_id]['frame_count'] - fps_streams[source_id]['last_print_frame']
-            avg_fps = frames_processed / time_elapsed
-
-            total_time_elapsed = current_time - fps_streams[source_id]['start_time']
-            overall_avg_fps = fps_streams[source_id]['frame_count'] / total_time_elapsed
-
-            print(f"Stream {source_id}: Current FPS: {avg_fps:.2f}, Overall Avg FPS: {overall_avg_fps:.2f}")
-
-            fps_streams[source_id]['last_print_time'] = current_time
-            fps_streams[source_id]['last_print_frame'] = fps_streams[source_id]['frame_count']
+        now = time.time()
+        if now - fps_streams[source_id]["last"] >= 5.0:
+            elapsed = now - fps_streams[source_id]["last"]
+            frames  = fps_streams[source_id]["cnt"]
+            print(f"[source-{source_id}]  FPS: {frames/elapsed:.2f}")
+            fps_streams[source_id]["last"] = now
+            fps_streams[source_id]["cnt"]  = 0
 
         try:
             l_frame = l_frame.next
         except StopIteration:
             break
-
     return Gst.PadProbeReturn.OK
 
-
 def cb_newpad(decodebin, decoder_src_pad, data):
-    print("In cb_newpad\n")
     caps = decoder_src_pad.get_current_caps()
+    if not caps:
+        return
     gststruct = caps.get_structure(0)
-    gstname = gststruct.get_name()
-    source_bin = data
+    gstname   = gststruct.get_name()
+    if "video" not in gstname:
+        return
     features = caps.get_features(0)
-
-    # Need to check if the pad created by the decodebin is for video and not
-    # audio.
-    print("gstname=", gstname)
-    if gstname.find("video") != -1:
-        # Link the decodebin pad only if decodebin has picked nvidia
-        # decoder plugin nvdec_*. We do this by checking if the pad caps contain
-        # NVMM memory features.
-        print("features=", features)
-        if features.contains("memory:NVMM"):
-            # Get the source bin ghost pad
-            bin_ghost_pad = source_bin.get_static_pad("src")
-            if not bin_ghost_pad.set_target(decoder_src_pad):
-                sys.stderr.write(
-                    "Failed to link decoder src pad to source bin ghost pad\n"
-                )
-        else:
-            sys.stderr.write(
-                " Error: Decodebin did not pick nvidia decoder plugin.\n")
-
+    if not features.contains("memory:NVMM"):
+        sys.stderr.write("Decodebin did not pick nvidia decoder plugin.\n")
+        return
+    bin_ghost_pad = data.get_static_pad("src")
+    if not bin_ghost_pad.set_target(decoder_src_pad):
+        sys.stderr.write("Failed to link decoder src pad to source bin ghost pad\n")
 
 def decodebin_child_added(child_proxy, Object, name, user_data):
-    print("Decodebin child added:", name, "\n")
     if name.find("decodebin") != -1:
         Object.connect("child-added", decodebin_child_added, user_data)
 
-    if ts_from_rtsp:
-        if name.find("source") != -1:
-            pyds.configure_source_for_ntp_sync(hash(Object))
+# def create_source_bin(index, uri):
+#     bin_name = f"source-bin-{index:02d}"
+#     nbin = Gst.Bin.new(bin_name)
+#     if not nbin:
+#         sys.stderr.write("Unable to create source bin\n")
+#         return None
+#     uri_decode_bin = Gst.ElementFactory.make("uridecodebin", "uri-decode-bin")
+#     if not uri_decode_bin:
+#         sys.stderr.write("Unable to create uri decode bin\n")
+#         return None
+#     uri_decode_bin.set_property("uri", uri)
+#     uri_decode_bin.connect("pad-added", cb_newpad, nbin)
+#     uri_decode_bin.connect("child-added", decodebin_child_added, nbin)
+#     Gst.Bin.add(nbin, uri_decode_bin)
+#     bin_pad = nbin.add_pad(Gst.GhostPad.new_no_target("src", Gst.PadDirection.SRC))
+#     if not bin_pad:
+#         sys.stderr.write("Failed to add ghost pad in source bin\n")
+#         return None
+#     return nbin
+
+
+def decodebin_child_added(child_proxy, Object, name, user_data):
+    """
+    1. Force every decodebin to use nvv4l2decoder  --> GPU memory (NVMM)
+    2. When the rtsp-source shows up, set its latency
+    """
+    # recurse into sub-decodebins
+    if name.find("decodebin") != -1:
+        Object.connect("child-added", decodebin_child_added, user_data)
+
+    # rtspsrc appears inside uridecodebin – set latency
+    if name.find("source") != -1 and Object.get_factory():
+        if Object.get_factory().get_name() == "rtspsrc":
+            Object.set_property("latency", 200)      # ms
+
+    # replace software decoders by nvv4l2decoder
+    for elem in Object.iterate_recurse():
+        if not elem.get_factory():
+            continue
+        fname = elem.get_factory().get_name()
+        if fname.startswith("avdec"):
+            parent = elem.get_parent()
+            if parent:
+                parent.remove(elem)
+                hwdec = Gst.ElementFactory.make("nvv4l2decoder", None)
+                if hwdec:
+                    parent.add(hwdec)
+                    hwdec.sync_state_with_parent()
 
 
 def create_source_bin(index, uri):
-    print("Creating source bin")
-
-    # Create a source GstBin to abstract this bin's content from the rest of the
-    # pipeline
-    bin_name = "source-bin-%02d" % index
-    print(bin_name)
+    """
+    Create a source-bin that works for files and RTSP.
+    latency is handled in decodebin_child_added above.
+    """
+    bin_name = f"source-bin-{index:02d}"
     nbin = Gst.Bin.new(bin_name)
     if not nbin:
-        sys.stderr.write(" Unable to create source bin \n")
+        sys.stderr.write("Unable to create source bin\n")
+        return None
 
-    # Source element for reading from the uri.
-    # We will use decodebin and let it figure out the container format of the
-    # stream and the codec and plug the appropriate demux and decode plugins.
     uri_decode_bin = Gst.ElementFactory.make("uridecodebin", "uri-decode-bin")
     if not uri_decode_bin:
-        sys.stderr.write(" Unable to create uri decode bin \n")
-    # We set the input uri to the source element
+        sys.stderr.write("Unable to create uri decode bin\n")
+        return None
+
     uri_decode_bin.set_property("uri", uri)
-    # Connect to the "pad-added" signal of the decodebin which generates a
-    # callback once a new pad for raw data has beed created by the decodebin
     uri_decode_bin.connect("pad-added", cb_newpad, nbin)
     uri_decode_bin.connect("child-added", decodebin_child_added, nbin)
 
-    # We need to create a ghost pad for the source bin which will act as a proxy
-    # for the video decoder src pad. The ghost pad will not have a target right
-    # now. Once the decode bin creates the video decoder and generates the
-    # cb_newpad callback, we will set the ghost pad target to the video decoder
-    # src pad.
-    Gst.Bin.add(nbin, uri_decode_bin)
-    bin_pad = nbin.add_pad(
-        Gst.GhostPad.new_no_target(
-            "src", 
-            Gst.PadDirection.SRC
-        )
-    )
-    if not bin_pad:
-        sys.stderr.write(" Failed to add ghost pad in source bin \n")
+    nbin.add(uri_decode_bin)
+
+    ghost_pad = nbin.add_pad(Gst.GhostPad.new_no_target("src", Gst.PadDirection.SRC))
+    if not ghost_pad:
+        sys.stderr.write("Failed to add ghost pad in source bin\n")
         return None
     return nbin
 
 
+class RTSP_Server:
+    def __init__(self, port, udp_port):
+        self.server = GstRtspServer.RTSPServer.new()
+        self.server.props.service = str(port)
+        self.server.attach(None)
+        factory = GstRtspServer.RTSPMediaFactory.new()
+        factory.set_launch(
+            f'( udpsrc name=pay0 port={udp_port} buffer-size=524288 caps="application/x-rtp, media=video, clock-rate=90000, encoding-name=(string){CODEC}, payload=96" )'
+        )
+        factory.set_shared(True)
+        self.server.get_mount_points().add_factory("/ds-test", factory)
+        print(f"\n *** RTSP stream ready at rtsp://127.0.0.1:{port}/ds-test ***\n")
+
 class NvPipeline:
-    def __init__(self, stream_paths: List):
+    def __init__(self, uris: List[str]):
         Gst.init(None)
-        
-        self.platform_info = PlatformInfo()
-        self.stream_paths = stream_paths
-
-        self.rtsp_port_num = 8555
-        self.udpsink_port_num = 5400
-
-        self.pipeline = Gst.Pipeline()
+        self.uris = uris
+        self.pipeline = Gst.Pipeline.new("pipeline")
         if not self.pipeline:
-            print("Unable to create pipeline")
+            raise RuntimeError("Unable to create pipeline")
+        self.frame_q = queue.Queue(maxsize=5)
 
-        self.output_streams = []
+    def build(self):
+        # streammux
+        mux = Gst.ElementFactory.make("nvstreammux", "mux")
+        mux.set_property("width",  MUXER_OUTPUT_WIDTH)
+        mux.set_property("height", MUXER_OUTPUT_HEIGHT)
+        mux.set_property("batch-size", len(self.uris))
+        mux.set_property("batched-push-timeout", MUXER_BATCH_TIMEOUT_USEC)
+        mux.set_property("live-source", 1)
+        mux.set_property("gpu-id", 0)
+        self.pipeline.add(mux)
 
-    def _plugins_created_succesfully(self, plugins: List) -> bool:
-        for e in plugins:
-            if not e:
-                print(f"Error: in element {e}")
-                return False
-            self.pipeline.add(e)
-        
-        return True
+        # source bins
+        # for idx, uri in enumerate(self.uris):
+        #     src_bin = create_source_bin(idx, uri)
+        #     self.pipeline.add(src_bin)
+        #     sinkpad = mux.request_pad_simple(f"sink_{idx}")
+        #     srcpad  = src_bin.get_static_pad("src")
+        #     srcpad.link(sinkpad)
 
-    def build_pipeline(self):
-        streammux = Gst.ElementFactory.make("nvstreammux", "Stream-muxer")
-        streammux.set_property("width", 1920)
-        streammux.set_property("height", 1080)
-        streammux.set_property("batch-size", len(self.stream_paths))
-        streammux.set_property("batched-push-timeout", MUXER_BATCH_TIMEOUT_USEC)
-        streammux.set_property("live-source", 1)
-
-        # add streamux to pipeline
-        self.pipeline.add(streammux)
-        is_live = False # temp varaible
-        for i, stream_path in enumerate(self.stream_paths):
-            if stream_path.find("rtsp://") == 0:
+        # self.pipeline.add(mux)
+        for i, uri in enumerate(self.uris):
+            print("Creating source_bin ",i," \n ")
+            uri_name=uri
+            if uri_name.find("rtsp://") == 0 :
                 is_live = True
-
-            source_bin = create_source_bin(i, stream_path)
+            source_bin=create_source_bin(i, uri_name)
             if not source_bin:
-                print("unable to create source")
-
+                sys.stderr.write("Unable to create source bin \n")
             self.pipeline.add(source_bin)
-
-            padname = "sink_%u" % i
-            sinkpad = streammux.request_pad_simple(padname)
+            padname="sink_%u" %i
+            sinkpad= mux.request_pad_simple(padname) 
             if not sinkpad:
-                print("Unable to create sink pad bin")
-
-            srcpad = source_bin.get_static_pad("src")
+                sys.stderr.write("Unable to create sink pad bin \n")
+            srcpad=source_bin.get_static_pad("src")
             if not srcpad:
-                print("Unable to create src pad bin")
-
+                sys.stderr.write("Unable to create src pad bin \n")
             srcpad.link(sinkpad)
 
-        nvinfer = Gst.ElementFactory.make("nvinfer", "primary-inference")
-        nvinfer.set_property("config-file-path", "/workspace/deepstream_app/configs/config_infer_primary_yolo11_fp32.txt")
+        # pgie
+        pgie = Gst.ElementFactory.make("nvinfer", "pgie")
+        pgie.set_property("config-file-path", PGIE_CONFIG)
 
-        # attach a probe to nvinfer plugin
-        pgie_src_pad=nvinfer.get_static_pad("src")
-        if not pgie_src_pad:
-            sys.stderr.write(" Unable to get src pad \n")
-        else:
-            pgie_src_pad.add_probe(Gst.PadProbeType.BUFFER, pgie_src_pad_buffer_probe, 0)
-
+        # tracker
         tracker = Gst.ElementFactory.make("nvtracker", "tracker")
         tracker.set_property("tracker-width", 640)
         tracker.set_property("tracker-height", 384)
         tracker.set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
-        tracker.set_property("ll-config-file", tracker_config)
+        tracker.set_property("ll-config-file", TRACKER_CONFIG)
 
-        demux = Gst.ElementFactory.make("nvstreamdemux", "demux")
-        for e in (nvinfer, tracker, demux):
-            self.pipeline.add(e)
+        # osd + tiler
+        osd   = Gst.ElementFactory.make("nvdsosd", "osd")
+        tiler = Gst.ElementFactory.make("nvmultistreamtiler", "tiler")
+        tiler.set_property("width",  TILED_OUTPUT_WIDTH)
+        tiler.set_property("height", TILED_OUTPUT_HEIGHT)
 
-        streammux.link(nvinfer)
-        nvinfer.link(tracker)
-        tracker.link(demux)
+        # ---  last NVMM converter  -----------------------------------------
+        conv = Gst.ElementFactory.make("nvvideoconvert", "conv")
 
-        for i, uri in enumerate(self.stream_paths):
-            q = Gst.ElementFactory.make("queue", f"queue_{i}")
-            osd = Gst.ElementFactory.make("nvdsosd", f"osd_{i}") 
-            conv = Gst.ElementFactory.make("nvvideoconvert", f"video_convert_{i}")
-            enc = Gst.ElementFactory.make("nvv4l2h264enc", f"encoder_{i}")
-            enc.set_property("bitrate", 1000_000)
-            pay = Gst.ElementFactory.make("rtph264pay", f"pay_{i}")
-            sink = Gst.ElementFactory.make("udpsink", f"sink_{i}")
-            sink.set_property("host", "224.224.255.255")
-            sink.set_property("port", self.udpsink_port_num + i)
-            sink.set_property("async", False)
-            sink.set_property("sync", 1)
-            sink.set_property("qos", 0)
+        # ---  converter to host memory for OpenCV  --------------------------
+        conv2cpu = Gst.ElementFactory.make("nvvideoconvert", "conv2cpu")
+        capsflt  = Gst.ElementFactory.make("capsfilter", "capsflt")
+        caps     = Gst.Caps.from_string("video/x-raw, format=RGBA")
+        capsflt.set_property("caps", caps)
 
-            for e in (q, osd, conv, enc, pay, sink):
-                self.pipeline.add(e)
+        # ---  encoder / pay / udp  ------------------------------------------
+        enc  = Gst.ElementFactory.make("nvv4l2h264enc", "enc")
+        enc.set_property("bitrate", BITRATE)
+        pay  = Gst.ElementFactory.make("rtph264pay", "pay")
+        sink = Gst.ElementFactory.make("udpsink", "sink")
+        sink.set_property("host", "224.224.255.255")
+        sink.set_property("port", UDP_PORT_BASE)
+        sink.set_property("async", False)
+        sink.set_property("sync", 1)
+        sink.set_property("qos", 0)
 
-            demux.link_pads(f"src_{i}", q, "sink")
-            q.link(osd)
-            osd.link(conv)
-            conv.link(enc)
-            enc.link(pay)
-            pay.link(sink)
+        # ---  add & link  ---------------------------------------------------
+        for el in (pgie, tracker, tiler, osd, conv, conv2cpu, capsflt, enc, pay, sink):
+            self.pipeline.add(el)
 
-            self.output_streams.append(
-                RTSP_Stream(self.rtsp_port_num + i, self.udpsink_port_num + i)
-            )
+        mux.link(pgie)
+        pgie.link(tracker)
+        tracker.link(tiler)
+        tiler.link(osd)
+        osd.link(conv)
+        conv.link(conv2cpu)
+        conv2cpu.link(capsflt)
+        capsflt.link(enc)
+        enc.link(pay)
+        pay.link(sink)
+
+        # ---  OpenCV probe on the host-memory pad  --------------------------
+        cpu_pad = capsflt.get_static_pad("src")
+        cpu_pad.add_probe(Gst.PadProbeType.BUFFER, self.opencv_probe, 0)
+
+        print("************** PIPELINE BUILD *************************")
+
+    def opencv_probe(self, pad, info, u_data):
+        buf = info.get_buffer()
+        if not buf:
+            return Gst.PadProbeReturn.OK
+        ok, map_info = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.PadProbeReturn.OK
+
+        caps   = pad.get_current_caps()
+        struct = caps.get_structure(0)
+        w      = struct.get_value("width")
+        h      = struct.get_value("height")
+
+        img = np.frombuffer(map_info.data, np.uint8).reshape((h, w, 4))
+        img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+
+        # drop old frames if viewer is too slow
+        if self.frame_q.full():
+            self.frame_q.get_nowait()
+        self.frame_q.put(img)
+
+        buf.unmap(map_info)
+        return Gst.PadProbeReturn.OK    
 
     def run(self):
-        self.build_pipeline()
+        self.build()
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
-
-        # Start Pipeline
         self.pipeline.set_state(Gst.State.PLAYING)
+        RTSP_Server(RTSP_PORT, UDP_PORT_BASE)
 
-        # stream = RTSP_Stream(self.rtsp_port_num, self.udpsink_port_num)
-        for stream in self.output_streams:
-            stream.run()
+        # ----  OPENCV GUI IN MAIN THREAD  ----
+        cv2.namedWindow("DeepStream", cv2.WINDOW_NORMAL)
+        while True:
+            try:
+                img = self.frame_q.get(timeout=1)   # 1 s so loop can be interrupted
+                cv2.imshow("DeepStream", img)
+            except queue.Empty:
+                img = None
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        cv2.destroyAllWindows()
+        # --------------------------------------
 
-        self.pipeline.set_state(Gst.State.NULL)
-
-
-class RTSP_Stream:
-    def __init__(self, rtsp_port_num, udp_port_num) -> None:
-        self.rtsp_port_num = rtsp_port_num
-        self.udp_port_num = udp_port_num
-
-        self.server = GstRtspServer.RTSPServer.new()
-        self.server.props.service = "%d" % self.rtsp_port_num
-        self.server.attach(None)
-
-        self.factory = GstRtspServer.RTSPMediaFactory.new()
-        self.factory.set_launch(
-            '( udpsrc name=pay0 port=%d buffer-size=524288 caps="application/x-rtp, media=video, clock-rate=90000, encoding-name=(string)%s, payload=96 " )'
-            % (self.udp_port_num, codec)
-        )
-        self.factory.set_shared(True)
-
-        self.server.get_mount_points().add_factory("/ds-test", self.factory)
-
-        self.stream_uri = f"Output RTSP: rtsp://localhost:{self.rtsp_port_num}/ds-test" 
-
-        print(
-            "\n\n",
-            self.stream_uri,
-            "\n\n"
-        )
-
-    
-    def run(self):
         loop = GLib.MainLoop()
         try:
             loop.run()
-        except BaseException:
+        except KeyboardInterrupt:
             pass
+        finally:
+            self.pipeline.set_state(Gst.State.NULL)
 
-if __name__ == '__main__':
-    stream_paths = [
-        "rtsp://admin:InLights@192.168.18.29:554" for _ in range(2)
-    ] 
+if __name__ == "__main__":
+    uris = [
+        "rtsp://admin:InLights@192.168.18.29:554"
+        # "file:///opt/nvidia/deepstream/deepstream-7.1/samples/streams/sample_1080p_h264.mp4"
+    ] * 1 
+    NvPipeline(uris).run()
 
-    obj = NvPipeline(stream_paths)
-    obj.run()
