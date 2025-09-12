@@ -4,20 +4,17 @@ import signal
 import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
-from core import ViolationDetection  # keep if you actually use it
+from core import ViolationDetection
 
 import numpy as np
 import cv2
 import queue
 import pyds
-import time
 
 # init GStreamer
 Gst.init(None)
 
 # --- CONFIG ---
-# NOTE: using the same URI repeated can cause server-side/session issues.
-# Replace these with 6 distinct URIs or 6 distinct test files for debugging.
 uris = [
     "rtsp://admin:InLights@192.168.18.29:554",
 ] * 6   # change or adjust as needed
@@ -26,17 +23,77 @@ BATCH_SIZE = len(uris)
 TILED_WIDTH = 1280
 TILED_HEIGHT = 1080
 
-frame_q = queue.Queue(maxsize=4)
+frame_q = queue.Queue(maxsize=2)
+deepstream_meta_data_q = queue.Queue(maxsize=2)
 
+vio_det = ViolationDetection(uris=uris)
+
+# --- Probe for metadata (before tiler) ---
+def osd_sink_pad_buffer_probe(pad, info, user_data):
+    gst_buffer = info.get_buffer()
+    if not gst_buffer:
+        return Gst.PadProbeReturn.OK
+
+    deepstream_meta_data = {}
+
+    try:
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+        if not batch_meta:
+            return Gst.PadProbeReturn.OK
+
+        l_frame = batch_meta.frame_meta_list
+        while l_frame is not None:
+            try:
+                frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+            except StopIteration:
+                break
+
+            source_id = frame_meta.source_id
+            frame_num = frame_meta.frame_num
+
+            deepstream_meta_data[source_id] = {
+                "frame_num": frame_num,
+                "boxes": [],
+                "confs": [],
+                "ids": [],
+                "classes": []
+            }
+
+            l_obj = frame_meta.obj_meta_list
+            while l_obj is not None:
+                try:
+                    obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                except StopIteration:
+                    break
+
+                deepstream_meta_data[source_id]["boxes"].append([
+                    int(obj_meta.rect_params.left),
+                    int(obj_meta.rect_params.top),
+                    int(obj_meta.rect_params.width),
+                    int(obj_meta.rect_params.height)
+                ])
+                deepstream_meta_data[source_id]["confs"].append(float(obj_meta.confidence))
+                deepstream_meta_data[source_id]["ids"].append(int(obj_meta.object_id))
+                deepstream_meta_data[source_id]["classes"].append(str(obj_meta.obj_label))
+
+                l_obj = l_obj.next
+            l_frame = l_frame.next
+
+        # Debug print
+        # print(deepstream_meta_data)
+        try:
+            deepstream_meta_data_q.put_nowait(deepstream_meta_data)
+        except queue.Full:
+            pass
+
+    except Exception as e:
+        print("Metadata access error:", e)
+
+    return Gst.PadProbeReturn.OK
+
+
+# --- Appsink callback for frames ---
 def on_new_sample(sink, user_data=None):
-    """
-    Called when appsink has a new sample.
-    Pulls the sample, extracts metadata via pyds,
-    converts to numpy and pushes to queue.
-    user_data is expected to be the GLib.MainLoop instance (optional).
-    """
-    loop = user_data if isinstance(user_data, GLib.MainLoop) else None
-
     sample = sink.emit("pull-sample")
     if sample is None:
         return Gst.FlowReturn.OK
@@ -53,74 +110,6 @@ def on_new_sample(sink, user_data=None):
     except Exception:
         return Gst.FlowReturn.OK
 
-    deepstream_meta_data = {}  # grouped by source_id; each value accumulates objects
-
-    # --- DeepStream metadata access ---
-    try:
-        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
-        if batch_meta:
-            l_frame = batch_meta.frame_meta_list
-            seen_source_ids = []
-            while l_frame is not None:
-                try:
-                    frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
-                except StopIteration:
-                    break
-
-                source_id = int(frame_meta.source_id)
-                frame_num = int(frame_meta.frame_num)
-
-                seen_source_ids.append(source_id)
-
-                # Initialize dict for this source_id if not present (don't overwrite)
-                deepstream_meta_data.setdefault(source_id, {
-                    "frame_nums": [],
-                    "boxes": [],
-                    "confs": [],
-                    "ids": [],
-                    "classes": []
-                })
-
-                # we append frame_num for traceability (there can be multiple frames per batch)
-                deepstream_meta_data[source_id]["frame_nums"].append(frame_num)
-
-                l_obj = frame_meta.obj_meta_list
-                while l_obj is not None:
-                    try:
-                        obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
-                    except StopIteration:
-                        break
-
-                    # bounding box as [left, top, width, height]
-                    deepstream_meta_data[source_id]["boxes"].append([
-                        int(obj_meta.rect_params.left),
-                        int(obj_meta.rect_params.top),
-                        int(obj_meta.rect_params.width),
-                        int(obj_meta.rect_params.height)
-                    ])
-                    deepstream_meta_data[source_id]["confs"].append(float(obj_meta.confidence))
-                    deepstream_meta_data[source_id]["ids"].append(int(obj_meta.object_id))
-                    deepstream_meta_data[source_id]["classes"].append(str(obj_meta.obj_label))
-
-                    l_obj = l_obj.next
-                l_frame = l_frame.next
-
-            # Debug: show which source_ids were present in this batch
-            if seen_source_ids:
-                print(f"[on_new_sample] batch contains source_ids: {sorted(set(seen_source_ids))}")
-            else:
-                print("[on_new_sample] batch contains NO frames")
-
-            # Debug: print per-source summary
-            for sid, meta in deepstream_meta_data.items():
-                n_objs = len(meta["ids"])
-                frame_nums = meta["frame_nums"]
-                print(f"  -> Source {sid} | frames: {frame_nums} | objects: {n_objs}")
-
-    except Exception as e:
-        print("Metadata access error:", e)
-
-    # --- Map buffer for frame extraction ---
     ok, mapinfo = buf.map(Gst.MapFlags.READ)
     if not ok:
         return Gst.FlowReturn.OK
@@ -133,11 +122,9 @@ def on_new_sample(sink, user_data=None):
             print("Reshape error:", e)
             return Gst.FlowReturn.OK
 
-        # push both frame and metadata tuple
         try:
-            frame_q.put_nowait((frame, deepstream_meta_data))
+            frame_q.put_nowait(frame)
         except queue.Full:
-            # drop silently if consumer is slow
             pass
     finally:
         buf.unmap(mapinfo)
@@ -156,27 +143,20 @@ def cb_newpad(decodebin, decoder_src_pad, data):
         return
     features = caps.get_features(0)
     if not features.contains("memory:NVMM"):
-        sys.stderr.write("Decodebin did not pick nvidia decoder plugin (NVMM missing). This will cause copy->CPU.\n")
-        # continue, still try to link but slower
+        sys.stderr.write("Decodebin did not pick nvidia decoder plugin.\n")
+        return
     bin_ghost_pad = data.get_static_pad("src")
     if not bin_ghost_pad.set_target(decoder_src_pad):
         sys.stderr.write("Failed to link decoder src pad to source bin ghost pad\n")
-    else:
-        print(f"[cb_newpad] linked decodebin src pad to ghost src (bin={data.get_name()})")
 
 
 def decodebin_child_added(child_proxy, Object, name, user_data):
-    """
-    Force decodebins to use nvv4l2decoder and set RTSP latency.
-    """
     if name.find("decodebin") != -1:
         Object.connect("child-added", decodebin_child_added, user_data)
 
     if name.find("source") != -1 and Object.get_factory():
         if Object.get_factory().get_name() == "rtspsrc":
-            # tune latency as needed
             Object.set_property("latency", 200)
-            print("[decodebin_child_added] set rtspsrc latency=200")
 
     for elem in Object.iterate_recurse():
         if not elem.get_factory():
@@ -190,20 +170,15 @@ def decodebin_child_added(child_proxy, Object, name, user_data):
                 if hwdec:
                     parent.add(hwdec)
                     hwdec.sync_state_with_parent()
-                    print("[decodebin_child_added] replaced avdec with nvv4l2decoder")
 
 
 def create_source_bin(index, uri):
-    """
-    Create a source bin with uridecodebin -> ghost src pad.
-    """
     bin_name = f"source-bin-{index:02d}"
     nbin = Gst.Bin.new(bin_name)
     if not nbin:
         sys.stderr.write("Unable to create source bin\n")
         return None
 
-    # unique decodebin name helps debugging
     uri_decode_bin = Gst.ElementFactory.make("uridecodebin", f"uri-decode-bin-{index:02d}")
     if not uri_decode_bin:
         sys.stderr.write("Unable to create uri decode bin\n")
@@ -220,15 +195,12 @@ def create_source_bin(index, uri):
     if not ghost_pad:
         sys.stderr.write("Failed to add ghost pad in source bin\n")
         return None
-
-    print(f"[create_source_bin] created source bin {bin_name} for uri: {uri}")
     return nbin
 
 
 def build_pipeline(loop):
     pipeline = Gst.Pipeline.new("deepstream-pipeline")
 
-    # nvstreammux
     mux = Gst.ElementFactory.make("nvstreammux", "mux")
     if not mux:
         raise RuntimeError("Failed to create nvstreammux")
@@ -237,35 +209,23 @@ def build_pipeline(loop):
     mux.set_property("batch-size", BATCH_SIZE)
     mux.set_property("live-source", 1)
     mux.set_property("gpu-id", 0)
-    # optional: mux.set_property("batched-push-timeout", 4000000)  # microsec
     pipeline.add(mux)
 
-    # sources
     for i, uri in enumerate(uris):
         src_bin = create_source_bin(i, uri)
         pipeline.add(src_bin)
         sink_pad = mux.get_request_pad(f"sink_{i}")
-        if not sink_pad:
-            raise RuntimeError(f"Failed to request sink_{i} from nvstreammux")
         src_pad = src_bin.get_static_pad("src")
-        # src_pad may be None until decodebin creates pads; warn but still try to link
-        if src_pad is None:
-            print(f"[build_pipeline] WARNING: src_bin {i} has no src pad yet. It will be linked later by cb_newpad.")
-        else:
-            res = src_pad.link(sink_pad)
-            if res != Gst.PadLinkReturn.OK:
-                print(f"[build_pipeline] Warning: src_pad.link(sink_{i}) returned {res}")
-            else:
-                print(f"[build_pipeline] linked source-bin-{i}.src -> mux.sink_{i}")
+        if not src_pad:
+            raise RuntimeError(f"Source bin {i} has no src pad")
+        src_pad.link(sink_pad)
 
-    # inference (primary)
     infer = Gst.ElementFactory.make("nvinfer", "primary-infer")
     if not infer:
         raise RuntimeError("Failed to create nvinfer")
     infer.set_property("config-file-path", "/workspace/deepstream_app/configs/config_infer_primary_yolo11_fp32.txt")
     pipeline.add(infer)
 
-    # tracker
     tracker = Gst.ElementFactory.make("nvtracker", "tracker")
     tracker.set_property("tracker-width", 640)
     tracker.set_property("tracker-height", 384)
@@ -273,7 +233,6 @@ def build_pipeline(loop):
     tracker.set_property("ll-config-file", "/opt/nvidia/deepstream/deepstream-7.1/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml")
     pipeline.add(tracker)
 
-    # tiler
     tiler = Gst.ElementFactory.make("nvmultistreamtiler", "tiler")
     if not tiler:
         raise RuntimeError("Failed to create tiler")
@@ -281,13 +240,11 @@ def build_pipeline(loop):
     tiler.set_property("height", TILED_HEIGHT)
     pipeline.add(tiler)
 
-    # osd
     osd = Gst.ElementFactory.make("nvdsosd", "osd")
     if not osd:
         raise RuntimeError("Failed to create nvdsosd")
     pipeline.add(osd)
 
-    # conversion chain
     conv = Gst.ElementFactory.make("nvvideoconvert", "conv")
     videoconvert = Gst.ElementFactory.make("videoconvert", "videoconvert")
     capsfilter = Gst.ElementFactory.make("capsfilter", "caps")
@@ -304,7 +261,7 @@ def build_pipeline(loop):
             raise RuntimeError("Failed to create one of conv/videoconvert/caps/appsink")
         pipeline.add(el)
 
-    # links
+    # link elements
     if not mux.link(infer):
         raise RuntimeError("Failed to link mux -> infer")
     if not infer.link(tracker):
@@ -322,52 +279,55 @@ def build_pipeline(loop):
     if not capsfilter.link(appsink):
         raise RuntimeError("Failed to link capsfilter -> appsink")
 
-    # connect appsink callback. Pass loop so callback can quit on 'q' if desired
-    appsink.connect("new-sample", on_new_sample, loop)
+    # connect appsink callback
+    appsink.connect("new-sample", on_new_sample, {"loop": loop})
 
-    print("[build_pipeline] pipeline built successfully")
+    # 🔑 attach probe BEFORE tiler (on tracker src pad)
+    tracker_src_pad = tracker.get_static_pad("src")
+    if not tracker_src_pad:
+        raise RuntimeError("Unable to get tracker src pad")
+    tracker_src_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe, None)
+
     return pipeline
 
 
 if __name__ == "__main__":
     loop = GLib.MainLoop()
-
-    # build pipeline
     pipeline = build_pipeline(loop)
 
-    # start playing
     ret = pipeline.set_state(Gst.State.PLAYING)
     if ret == Gst.StateChangeReturn.FAILURE:
         print("Failed to set pipeline to PLAYING")
         sys.exit(1)
 
-    # handle Ctrl+C
     def sigint_handler(sig, frame):
         print("Interrupted: quitting main loop")
         loop.quit()
 
     signal.signal(signal.SIGINT, sigint_handler)
 
-    ############## opencv loop ###########
-    print("Starting OpenCV display loop. Press 'q' in window to quit.")
+    cv2.namedWindow("live inference", cv2.WINDOW_NORMAL)
     while True:
+        # get frame from Queue
         try:
-            frame, metadata = frame_q.get(timeout=1.0)
+            frame = frame_q.get()
         except queue.Empty:
-            # no frame for a second, continue
-            continue
+            print("Queue is empty")
+            frame = np.ones((680, 680, 3), dtype=np.uint8)
 
-        # show tile or single frame; for demo we'll show the frame as-is
+        # get metadata from Queue
+        try:
+            meta_data = deepstream_meta_data_q.get()
+        except queue.Full:
+            pass
+        
+        vio_det.video_processor(meta_data)
+
         cv2.imshow("live inference", frame)
-        # quick debug overlay of metadata counts
-        # overlay = f"sources: {len(metadata)}"
-        # cv2.putText(frame, overlay, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
         if cv2.waitKey(1) & 0xff == ord("q"):
             break
-    #######################################
 
     try:
-        print("Running main loop — press Ctrl+C or focus the window and press 'q' to quit")
         loop.run()
     except Exception as e:
         print("Exception in main loop:", e)
